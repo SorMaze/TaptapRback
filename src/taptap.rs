@@ -29,6 +29,13 @@ impl Region {
             Self::Global => "https://open.tapapis.com",
         }
     }
+
+    pub fn authorize_host(self) -> &'static str {
+        match self {
+            Self::Cn => "https://accounts.taptap.cn",
+            Self::Global => "https://www.taptapauth.com",
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -154,6 +161,32 @@ impl TapClient {
                 ("client_id", client_id),
                 ("secret_type", "hmac-sha-1"),
                 ("code", code),
+            ])
+            .send()
+            .await
+            .map_err(|_| TapError::Upstream)?;
+        Self::parse_response(response).await
+    }
+
+    pub async fn exchange_code(
+        &self,
+        region: Region,
+        client_id: &str,
+        code: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> Result<AccessToken, TapError> {
+        let url = format!("{}/oauth2/v1/token", self.accounts(region));
+        let response = self
+            .http
+            .post(url)
+            .form(&[
+                ("client_id", client_id),
+                ("grant_type", "authorization_code"),
+                ("secret_type", "hmac-sha-1"),
+                ("code", code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", code_verifier),
             ])
             .send()
             .await

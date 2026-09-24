@@ -1,15 +1,16 @@
 # TapTap Axum 登录后端
 
-此服务支持 TapTap 国内版和国际版的两种登录入口：
+此服务支持 TapTap 国内版和国际版的三种登录入口：
 
 1. 游戏客户端使用 TapSDK 登录后，把 `AccessToken` 中的 `kid`、`mac_key` 交给服务端；服务端调用 TapTap OpenAPI 验证并签发自己的会话 JWT。
-2. PC 或网页展示二维码，服务端执行 OAuth 2.0 设备码流程，扫码成功后验证资料并签发会话 JWT。
+2. PC 或网页展示二维码，服务端执行 OAuth 2.0 设备码流程，扫码成功后验证资料并签发会话 JWT。手机浏览器打开同一页面时，可以直接点按按钮跳转到 TapTap 授权页（由 TapTap 页面引导唤起客户端），无需扫描自己屏幕上的二维码。
+3. 配置 `PUBLIC_BASE_URL` 后，手机网页可走授权码 + PKCE 跳转流程：浏览器重定向到 TapTap 授权页，授权后回调本服务换取凭证、签发会话并自动返回页面。该流程的 `redirect_uri` 约定来自 TapTap 公开 SDK 的实现，已用国内版应用完成 loopback 地址的真实验证；公网域名与国际版路径接入前建议各做一次同样验证（见 `docs/decisions/0002-web-authorize-flow.md`）。
 
 项目不会从客户端提交的 `openid` 直接建立会话。`openid`、`unionid` 均以 TapTap OpenAPI 的响应为准。
 
 ## 登录网页
 
-启动服务后打开 `http://127.0.0.1:3000/`。Axum 同源提供页面、样式、脚本和登录 API。页面会按服务器配置显示可选区域，自动生成扫码二维码，遵守 TapTap 返回的轮询间隔，授权后再调用 `/auth/me` 校验游戏会话。登录会话保存在当前浏览器标签的 `sessionStorage` 中；“清除本地会话”只清除浏览器里的令牌，不撤销已签发的 JWT。部署到公网时应通过 HTTPS 反向代理提供服务。
+启动服务后打开 `http://127.0.0.1:3000/`。Axum 同源提供页面、样式、脚本和登录 API。页面会按服务器配置显示可选区域，自动生成扫码二维码，遵守 TapTap 返回的轮询间隔，授权后再调用 `/auth/me` 校验游戏会话。手机浏览器打开时页面不显示二维码：配置了 `PUBLIC_BASE_URL` 时会直接重定向到 TapTap 授权页，授权完成自动跳回；未配置时显示“打开 TapTap 完成授权”按钮，点按后在当前标签页打开授权地址，返回页面时自动继续等待授权结果。登录会话保存在当前浏览器标签的 `sessionStorage` 中；“清除本地会话”只清除浏览器里的令牌，不撤销已签发的 JWT。部署到公网时应通过 HTTPS 反向代理提供服务。
 
 ## 启动
 
@@ -20,10 +21,11 @@ $env:TAPTAP_CN_CLIENT_ID = "国内应用的 Client ID"
 $env:TAPTAP_GLOBAL_CLIENT_ID = "国际应用的 Client ID"
 $env:SESSION_SECRET = "至少 32 字节的随机字符串，生产环境请安全保存"
 $env:BIND_ADDR = "127.0.0.1:3000"
+$env:PUBLIC_BASE_URL = "https://login.example.com"  # 可选，启用网页跳转登录时必填
 cargo run
 ```
 
-国内和国际应用的 Client ID 分开配置；只接入一个区域时可省略另一个。默认仅监听本机；部署时由 HTTPS 反向代理对外提供服务。`SESSION_SECRET` 改变后旧会话会失效。
+国内和国际应用的 Client ID 分开配置；只接入一个区域时可省略另一个。默认仅监听本机；部署时由 HTTPS 反向代理对外提供服务。`SESSION_SECRET` 改变后旧会话会失效。`PUBLIC_BASE_URL` 是服务对外的完整基地址（不带路径），用于生成 TapTap 授权回调地址；不设置时 `/auth/taptap/web` 返回 `web_login_not_configured`，手机网页回退到设备码跳转模式。
 
 ## HTTP API
 
@@ -55,6 +57,15 @@ cargo run
 
 服务器保存 `device_code`，不把它交给前端。流程状态目前保存在进程内存中，服务重启后未完成的扫码流程失效；多实例部署需要把流程状态迁移到共享存储。
 
+### 网页跳转登录（授权码 + PKCE）
+
+仅在配置 `PUBLIC_BASE_URL` 后可用，面向手机浏览器等不便扫码的场景。
+
+1. `POST /auth/taptap/web`，请求体为 `{"region":"cn"}` 或 `{"region":"global"}`。返回 `authorize_url`、`expires_in`（600 秒）。前端将浏览器重定向到 `authorize_url`（TapTap 授权页，国内为 `accounts.taptap.cn`，国际为 `www.taptapauth.com`）。
+2. 用户在 TapTap 完成授权后，TapTap 重定向到 `GET {PUBLIC_BASE_URL}/auth/taptap/web/callback?code=...&state=...`。服务端校验 `state`、用 PKCE `code_verifier` 换取 Access Token、拉取用户资料并签发会话 JWT，然后返回一个把会话写入 `sessionStorage` 并跳回首页的小页面。每个 `state` 只能成功消费一次；授权方返回 `error` 时展示失败页。
+
+`code_verifier` 只保存在服务端进程内存中，重启后未完成的流程失效。该流程的授权页地址与参数取自 TapTap 公开 SDK 的实现；2026-09-24 已用国内版应用验证 loopback 形式的 `redirect_uri` 可用，公网 HTTPS 域名与国际版路径尚未验证，上线公网前建议用正式域名再做一次验证（见 `docs/decisions/0002-web-authorize-flow.md`）。
+
 ### 会话检查
 
 `GET /auth/me`，请求头 `Authorization: Bearer <session_token>`，返回 JWT 中的 `sub`（`openid`）、`region` 和过期时间。业务数据库应使用 `(region, openid)` 作为用户身份键，避免跨区域混淆。此服务目前没有账号持久化、会话撤销或绑定其他平台账号的功能。
@@ -73,11 +84,13 @@ MAC 签名串是 `timestamp\nnonce\nmethod\nuri\nhost\nport\n\n`，使用授权�
 
 ## 验证
 
-运行 `cargo test` 和 `cargo clippy --all-targets -- -D warnings`。测试包含独立 HMAC 样例、模拟 TapTap OpenAPI 的 SDK 登录、设备码待授权到成功、会话验证和流程单次消费。
+运行 `cargo test` 和 `cargo clippy --all-targets -- -D warnings`。测试包含独立 HMAC 样例、模拟 TapTap OpenAPI 的 SDK 登录、设备码待授权到成功、会话验证、流程单次消费，以及模拟上游的网页授权码流程（PKCE 换 token、state 校验与单次消费、授权方返回 error）。
 
 2026-09-23 使用用户提供的国内版 Client ID 完成了一次真实设备码登录：TapTap 返回二维码，扫码后 token 轮询成功，MAC 签名请求获取到 `openid` / `unionid`，应用签发的会话通过 `/auth/me`，重复消费流程返回 404。测试账号标识和会话令牌未写入仓库。国际版路径按官方 SDK 区域实现接入，尚未使用国际版应用做真实账号验收。
 
 同日还在 Axum 提供的网页上完成真实扫码登录，浏览器显示“游戏登录成功”，成功页使用服务端验证后的玩家资料。头像地址在测试浏览器无法加载时，页面自动隐藏破图；刷新后 `/auth/me` 再次校验会话，玩家名称与区域正确恢复。测试时服务监听 `127.0.0.1:3000`，`/health` 返回 HTTP 200。
+
+2026-09-24 使用用户提供的国内版 Client ID 完成真实网页跳转登录：浏览器打开 `/auth/taptap/web` 返回的授权链接，TapTap 接受 `http://127.0.0.1:3000` 形式的 `redirect_uri` 并在授权后回调；服务端用 PKCE 换得 MAC 凭证、验证资料并签发会话，浏览器显示“游戏登录成功”，重复回调同一 `state` 返回 404。公网 HTTPS 域名回调与国际版网页流程尚未验证，详见 `docs/decisions/0002-web-authorize-flow.md`。测试账号标识和会话令牌未写入仓库。
 
 ## 许可证
 
