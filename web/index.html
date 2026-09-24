@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>游戏登录 · TapTap</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="site-header">
+        <a class="brand" href="/" aria-label="返回游戏登录首页">
+          <span class="brand-mark" aria-hidden="true"
+            ><span></span><span></span
+          ></span>
+          <span class="brand-name">GAME<span>GATE</span></span>
+        </a>
+        <span class="header-label"
+          ><span class="header-dot"></span> TapTap 账号接入演示</span
+        >
+      </header>
+
+      <main class="main-grid">
+        <section class="intro" aria-labelledby="page-title">
+          <div class="eyebrow">
+            <span class="eyebrow-line"></span> 安全连接 · TaptapRback
+          </div>
+          <h1 id="page-title">准备好进入<br /><em>游戏世界</em>了吗？</h1>
+          <p class="lead">
+            使用 TapTap
+            账号授权，建立你的游戏登录会话。授权完成后，页面会从游戏服务器读取已验证的身份。
+          </p>
+
+          <div class="steps" aria-label="登录步骤">
+            <div class="step">
+              <span class="step-number">01</span>
+              <div>
+                <strong>选择账号区域</strong
+                ><small>国内版或国际版 TapTap</small>
+              </div>
+            </div>
+            <div class="step">
+              <span class="step-number">02</span>
+              <div>
+                <strong>打开 TapTap 扫码</strong
+                ><small>在手机端确认本次授权</small>
+              </div>
+            </div>
+            <div class="step">
+              <span class="step-number">03</span>
+              <div>
+                <strong>完成游戏登录</strong><small>服务器验证后建立会话</small>
+              </div>
+            </div>
+          </div>
+
+          <div class="intro-foot">
+            <span class="shield-icon" aria-hidden="true">✦</span>
+            授权凭证由游戏服务器向 TapTap 校验
+          </div>
+        </section>
+
+        <section class="login-card" aria-labelledby="card-title">
+          <div class="card-head">
+            <div>
+              <span class="card-kicker">ACCOUNT ACCESS</span>
+              <h2 id="card-title">TapTap 登录</h2>
+            </div>
+            <span class="card-symbol" aria-hidden="true">↗</span>
+          </div>
+
+          <div id="region-block" class="region-block">
+            <span class="field-label">账号区域</span>
+            <div
+              class="region-switch"
+              role="group"
+              aria-label="选择 TapTap 账号区域"
+            >
+              <button
+                id="region-cn"
+                class="region-option active"
+                type="button"
+                aria-pressed="true"
+              >
+                国内版 <span>CN</span>
+              </button>
+              <button
+                id="region-global"
+                class="region-option"
+                type="button"
+                aria-pressed="false"
+              >
+                国际版 <span>GLOBAL</span>
+              </button>
+            </div>
+            <p id="region-note" class="region-note">
+              使用国内版 TapTap 客户端扫描
+            </p>
+          </div>
+
+          <div id="login-panel" class="login-panel">
+            <div class="qr-stage">
+              <div class="qr-frame">
+                <div id="qr-loading" class="qr-loading">
+                  <span class="spinner"></span><span>正在生成二维码</span>
+                </div>
+                <img id="qr-image" alt="TapTap 登录二维码" hidden />
+                <div id="qr-expired" class="qr-expired" hidden>
+                  <span>⌛</span><strong>二维码已过期</strong
+                  ><small>点击下方按钮重新生成</small>
+                </div>
+              </div>
+            </div>
+            <div class="qr-meta">
+              <span id="qr-state" class="state-pill"
+                ><span class="pulse"></span>准备连接</span
+              ><span id="countdown">--:--</span>
+            </div>
+            <p
+              id="status-text"
+              class="status-text"
+              role="status"
+              aria-live="polite"
+            >
+              正在连接 TapTap 授权服务…
+            </p>
+            <button
+              id="refresh-button"
+              class="primary-button"
+              type="button"
+              hidden
+            >
+              重新生成二维码 <span aria-hidden="true">↗</span>
+            </button>
+            <a
+              id="open-link"
+              class="manual-link"
+              href="#"
+              target="_blank"
+              rel="noopener noreferrer"
+              hidden
+              >在浏览器中打开授权页面 <span aria-hidden="true">↗</span></a
+            >
+          </div>
+
+          <div id="success-panel" class="success-panel" hidden>
+            <div class="success-check" aria-hidden="true">✓</div>
+            <h3>游戏登录成功</h3>
+            <p>TapTap 授权已由游戏服务器验证</p>
+            <div class="user-row">
+              <img id="user-avatar" alt="" hidden />
+              <div>
+                <strong id="user-name">TapTap 玩家</strong
+                ><small>已连接 · <span id="user-region">国内版</span></small>
+              </div>
+            </div>
+            <div class="identity-row">
+              <span>游戏身份 ID</span><code id="user-id"></code>
+            </div>
+            <button id="logout-button" class="secondary-button" type="button">
+              清除本地会话
+            </button>
+          </div>
+
+          <div class="card-footer">
+            <span class="footer-lock" aria-hidden="true">◇</span>
+            仅用于本游戏登录，页面不会获取你的密码
+          </div>
+        </section>
+      </main>
+
+      <footer class="site-footer">
+        <span>GAMEGATE / TAPTAP LOGIN</span><span>由当前 Axum 服务提供</span>
+      </footer>
+    </div>
+  </body>
+</html>
