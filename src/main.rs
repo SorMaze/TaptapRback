@@ -10,13 +10,16 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::Html,
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::taptap::{AccessToken, Profile, Region, TapClient, TapError};
@@ -26,6 +29,7 @@ struct Config {
     cn_client_id: Option<String>,
     global_client_id: Option<String>,
     session_secret: Vec<u8>,
+    public_base_url: Option<String>,
 }
 
 impl Config {
@@ -45,10 +49,20 @@ impl Config {
         if session_secret.len() < 32 {
             return Err("SESSION_SECRET must contain at least 32 bytes".into());
         }
+        let public_base_url = env::var("PUBLIC_BASE_URL")
+            .ok()
+            .filter(|v| !v.is_empty());
+        if let Some(base) = &public_base_url
+            && !base.starts_with("https://")
+            && !base.starts_with("http://")
+        {
+            return Err("PUBLIC_BASE_URL must start with https:// or http://".into());
+        }
         Ok(Self {
             cn_client_id,
             global_client_id,
             session_secret,
+            public_base_url,
         })
     }
 
@@ -65,6 +79,7 @@ struct AppState {
     config: Config,
     tap: TapClient,
     flows: Arc<Mutex<HashMap<String, Arc<Mutex<DeviceFlow>>>>>,
+    web_flows: Arc<Mutex<HashMap<String, Arc<Mutex<WebFlow>>>>>,
 }
 
 struct DeviceFlow {
@@ -73,6 +88,14 @@ struct DeviceFlow {
     expires_at: Instant,
     interval: Duration,
     next_poll_at: Instant,
+    finished: bool,
+}
+
+struct WebFlow {
+    region: Region,
+    code_verifier: String,
+    redirect_uri: String,
+    expires_at: Instant,
     finished: bool,
 }
 
@@ -228,8 +251,7 @@ async fn device_start(
     let mut random = [0u8; 32];
     getrandom::fill(&mut random)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "random_error"))?;
-    use base64::Engine;
-    let flow_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let flow_id = URL_SAFE_NO_PAD.encode(random);
     let now = Instant::now();
     let mut flows = state.flows.lock().await;
     flows.retain(|_, flow| {
@@ -264,12 +286,14 @@ async fn device_start(
 struct PublicConfig {
     cn: bool,
     global: bool,
+    web: bool,
 }
 
 async fn public_config(State(state): State<AppState>) -> Json<PublicConfig> {
     Json(PublicConfig {
         cn: state.config.cn_client_id.is_some(),
         global: state.config.global_client_id.is_some(),
+        web: state.config.public_base_url.is_some(),
     })
 }
 
@@ -371,6 +395,241 @@ async fn device_poll(
     Ok((StatusCode::OK, Json(PollResponse::Complete { login })))
 }
 
+#[derive(Serialize)]
+struct WebStartResponse {
+    authorize_url: String,
+    expires_in: u64,
+}
+
+const WEB_FLOW_TTL: Duration = Duration::from_secs(600);
+
+async fn web_start(
+    State(state): State<AppState>,
+    Json(body): Json<RegionRequest>,
+) -> ApiResult<Json<WebStartResponse>> {
+    let base = state
+        .config
+        .public_base_url
+        .as_deref()
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "web_login_not_configured"))?;
+    let client_id = state
+        .config
+        .client_id(body.region)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "region_not_configured"))?;
+    let redirect_uri = format!(
+        "{}/auth/taptap/web/callback",
+        base.trim_end_matches('/')
+    );
+    let mut random = [0u8; 64];
+    getrandom::fill(&mut random)
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "random_error"))?;
+    let flow_id = URL_SAFE_NO_PAD.encode(&random[..32]);
+    let code_verifier = URL_SAFE_NO_PAD.encode(&random[32..]);
+    let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+    let mut url = Url::parse(&format!("{}/authorize", body.region.authorize_host()))
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "authorize_url_error"))?;
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("state", &flow_id)
+        .append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("scope", "public_profile");
+    let now = Instant::now();
+    let mut flows = state.web_flows.lock().await;
+    flows.retain(|_, flow| {
+        flow.try_lock()
+            .map(|guard| guard.expires_at > now && !guard.finished)
+            .unwrap_or(true)
+    });
+    if flows.len() >= 10_000 {
+        return Err(error(StatusCode::SERVICE_UNAVAILABLE, "too_many_flows"));
+    }
+    flows.insert(
+        flow_id,
+        Arc::new(Mutex::new(WebFlow {
+            region: body.region,
+            code_verifier,
+            redirect_uri,
+            expires_at: now + WEB_FLOW_TTL,
+            finished: false,
+        })),
+    );
+    Ok(Json(WebStartResponse {
+        authorize_url: url.into(),
+        expires_in: WEB_FLOW_TTL.as_secs(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct WebCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn json_for_script(value: &serde_json::Value) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_default()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+}
+
+fn callback_page(title: &str, body: &str) -> Html<String> {
+    Html(format!(
+        r#"<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>{title} · TapTap 登录</title>
+    <style>
+      body {{ margin: 0; min-height: 100vh; display: grid; place-items: center;
+             background: #07111c; color: #ecf5ff;
+             font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif; }}
+      main {{ text-align: center; padding: 24px; }}
+      p {{ color: #9cafbf; font-size: 14px; }}
+      a {{ color: #79e4d6; }}
+    </style>
+  </head>
+  <body>
+    <main>{body}</main>
+  </body>
+</html>"#
+    ))
+}
+
+fn callback_error_page(detail: &str) -> Html<String> {
+    callback_page(
+        "登录失败",
+        &format!(
+            "<h1>登录未完成</h1><p>{}</p><p><a href=\"/\">返回登录页重试</a></p>",
+            html_escape(detail)
+        ),
+    )
+}
+
+fn callback_success_page(login: &LoginResponse) -> Html<String> {
+    let payload = json_for_script(&serde_json::json!({
+        "session_token": login.session_token,
+        "region": login.region,
+        "user": {
+            "openid": login.user.openid,
+            "name": login.user.name,
+            "avatar": login.user.avatar,
+        },
+    }));
+    callback_page(
+        "登录成功",
+        &format!(
+            r#"<h1>授权成功</h1><p>正在返回游戏…</p>
+    <script>
+      const login = {payload};
+      sessionStorage.setItem("taptap_game_session", login.session_token);
+      sessionStorage.setItem(
+        "taptap_game_profile",
+        JSON.stringify({{
+          sub: login.user.openid,
+          region: login.region,
+          name: login.user.name || "TapTap 玩家",
+          avatar: login.user.avatar || null,
+        }}),
+      );
+      location.replace("/");
+    </script>
+    <noscript><p><a href="/">返回登录页</a></p></noscript>"#
+        ),
+    )
+}
+
+async fn web_callback(
+    State(state): State<AppState>,
+    Query(query): Query<WebCallbackQuery>,
+) -> (StatusCode, Html<String>) {
+    if let Some(denied) = query.error {
+        return (
+            StatusCode::BAD_REQUEST,
+            callback_error_page(&format!("TapTap 返回错误：{denied}")),
+        );
+    }
+    let (Some(code), Some(flow_id)) = (query.code, query.state) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            callback_error_page("回调参数不完整"),
+        );
+    };
+    let flow = state.web_flows.lock().await.get(&flow_id).cloned();
+    let Some(flow) = flow else {
+        return (
+            StatusCode::NOT_FOUND,
+            callback_error_page("登录流程不存在或已过期，请重新发起"),
+        );
+    };
+    let mut flow = flow.lock().await;
+    if flow.finished {
+        return (
+            StatusCode::NOT_FOUND,
+            callback_error_page("登录流程已被使用，请重新发起"),
+        );
+    }
+    flow.finished = true;
+    if Instant::now() >= flow.expires_at {
+        drop(flow);
+        state.web_flows.lock().await.remove(&flow_id);
+        return (
+            StatusCode::GONE,
+            callback_error_page("登录流程已过期，请重新发起"),
+        );
+    }
+    let region = flow.region;
+    let client_id = match state.config.client_id(region) {
+        Some(client_id) => client_id,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                callback_error_page("该区域未配置"),
+            );
+        }
+    };
+    let result = state
+        .tap
+        .exchange_code(region, client_id, &code, &flow.redirect_uri, &flow.code_verifier)
+        .await;
+    let token = match result {
+        Ok(token) => token,
+        Err(e) => {
+            let (status, _) = tap_error(e);
+            return (status, callback_error_page("授权凭证校验失败，请重试"));
+        }
+    };
+    let user = match state.tap.profile(region, client_id, &token, true).await {
+        Ok(user) => user,
+        Err(e) => {
+            let (status, _) = tap_error(e);
+            return (status, callback_error_page("获取用户信息失败，请重试"));
+        }
+    };
+    let login = match issue_session(&state, region, user) {
+        Ok(login) => login,
+        Err((status, _)) => {
+            return (status, callback_error_page("建立游戏会话失败，请重试"));
+        }
+    };
+    drop(flow);
+    state.web_flows.lock().await.remove(&flow_id);
+    (StatusCode::OK, callback_success_page(&login))
+}
+
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Claims>> {
     let token = headers
         .get("Authorization")
@@ -400,6 +659,8 @@ fn router(state: AppState) -> Router {
         .route("/auth/taptap/sdk", post(sdk_login))
         .route("/auth/taptap/device", post(device_start))
         .route("/auth/taptap/device/{flow_id}/poll", post(device_poll))
+        .route("/auth/taptap/web", post(web_start))
+        .route("/auth/taptap/web/callback", get(web_callback))
         .route("/auth/me", get(me))
         .with_state(state)
 }
@@ -414,6 +675,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         tap: TapClient::new()?,
         flows: Arc::new(Mutex::new(HashMap::new())),
+        web_flows: Arc::new(Mutex::new(HashMap::new())),
     };
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("listening on {}", listener.local_addr()?);
@@ -424,7 +686,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::Query;
+    use axum::extract::{Form, Query};
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -488,11 +750,13 @@ mod tests {
                 cn_client_id: Some("test-client".into()),
                 global_client_id: None,
                 session_secret: vec![42; 32],
+                public_base_url: None,
             },
             tap: TapClient::new()
                 .unwrap()
                 .with_hosts(&upstream_url, &upstream_url),
             flows: Arc::new(Mutex::new(HashMap::new())),
+            web_flows: Arc::new(Mutex::new(HashMap::new())),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -574,5 +838,147 @@ mod tests {
             client.post(&poll_url).send().await.unwrap().status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn web_login_exchanges_code_and_consumes_state() {
+        async fn token(Form(form): Form<HashMap<String, String>>) -> Json<Value> {
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("authorization_code")
+            );
+            assert_eq!(
+                form.get("client_id").map(String::as_str),
+                Some("test-client")
+            );
+            assert_eq!(form.get("code").map(String::as_str), Some("code-1"));
+            assert!(
+                form.get("redirect_uri")
+                    .is_some_and(|v| v.ends_with("/auth/taptap/web/callback"))
+            );
+            assert!(
+                form.get("code_verifier")
+                    .is_some_and(|v| v.len() >= 43)
+            );
+            Json(json!({"success":true,"data":{
+                "kid":"kid-1","mac_key":"secret","mac_algorithm":"hmac-sha-1","scope":"public_profile"
+            }}))
+        }
+        async fn profile(headers: HeaderMap) -> Json<Value> {
+            assert!(
+                headers
+                    .get("Authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("MAC id=\"kid-1\"")
+            );
+            Json(json!({"success":true,"data":{
+                "openid":"user-1","unionid":"vendor-user-1","name":"Tester","avatar":"https://example.test/avatar"
+            }}))
+        }
+        let upstream = Router::new()
+            .route("/oauth2/v1/token", post(token))
+            .route("/account/profile/v1", get(profile));
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", upstream_listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let state = AppState {
+            config: Config {
+                cn_client_id: Some("test-client".into()),
+                global_client_id: None,
+                session_secret: vec![42; 32],
+                public_base_url: Some(base.clone()),
+            },
+            tap: TapClient::new()
+                .unwrap()
+                .with_hosts(&upstream_url, &upstream_url),
+            flows: Arc::new(Mutex::new(HashMap::new())),
+            web_flows: Arc::new(Mutex::new(HashMap::new())),
+        };
+        tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let config = client
+            .get(format!("{base}/auth/config"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(config["web"], true);
+
+        let start = client
+            .post(format!("{base}/auth/taptap/web"))
+            .json(&json!({"region":"cn"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+        let start: Value = start.json().await.unwrap();
+        let authorize = Url::parse(start["authorize_url"].as_str().unwrap()).unwrap();
+        assert_eq!(authorize.host_str(), Some("accounts.taptap.cn"));
+        assert_eq!(authorize.path(), "/authorize");
+        let params: HashMap<_, _> = authorize.query_pairs().collect();
+        assert_eq!(
+            params.get("client_id").map(|v| v.as_ref()),
+            Some("test-client")
+        );
+        let expected_redirect = format!("{base}/auth/taptap/web/callback");
+        assert_eq!(
+            params.get("redirect_uri").map(|v| v.as_ref()),
+            Some(expected_redirect.as_str())
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(|v| v.as_ref()),
+            Some("S256")
+        );
+        assert!(params.contains_key("code_challenge"));
+        let flow_state = params.get("state").unwrap().to_string();
+
+        let wrong_state = client
+            .get(format!(
+                "{base}/auth/taptap/web/callback?code=code-1&state=wrong"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_state.status(), StatusCode::NOT_FOUND);
+
+        let callback = client
+            .get(format!(
+                "{base}/auth/taptap/web/callback?code=code-1&state={flow_state}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::OK);
+        let page = callback.text().await.unwrap();
+        assert!(page.contains("taptap_game_session"));
+        assert!(page.contains("eyJ"));
+        assert!(page.contains("location.replace"));
+
+        let replay = client
+            .get(format!(
+                "{base}/auth/taptap/web/callback?code=code-1&state={flow_state}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::NOT_FOUND);
+
+        let denied = client
+            .get(format!(
+                "{base}/auth/taptap/web/callback?error=access_denied&state={flow_state}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        assert!(denied.text().await.unwrap().contains("access_denied"));
     }
 }

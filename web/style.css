@@ -411,6 +411,13 @@ button {
 .manual-link:hover {
   text-decoration: underline;
 }
+.mobile-open {
+  text-decoration: none;
+  margin: 21px 0 7px;
+}
+body.mobile .qr-stage {
+  display: none;
+}
 .card-footer {
   height: 55px;
   margin: 0 -38px;
