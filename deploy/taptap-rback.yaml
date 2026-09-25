@@ -1,0 +1,99 @@
+# TaptapRback 在 k3s 集群里的工作负载（示例，按需替换命名空间与域名）。
+#
+# 部署前必须先创建 Secret（不要提交到仓库）：
+#   kubectl -n taptap create secret generic taptap-rback-secrets \
+#     --from-literal=TAPTAP_CN_CLIENT_ID='<Client ID>' \
+#     --from-literal=SESSION_SECRET="$(head -c 48 /dev/urandom | base64 | tr -d '\n')"
+#
+# 镜像不进 registry：单节点 k3s，docker save 后 k3s ctr images import 导入，
+# 因此 imagePullPolicy 固定为 Never。
+#
+# 宿主 nginx 反代到 NodePort 30084，把 /taptap/ 前缀剥掉再转发，
+# 所以容器里看到的仍然是根路径路由。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taptap-rback
+  namespace: taptap
+  labels:
+    app: taptap-rback
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taptap-rback
+  template:
+    metadata:
+      labels:
+        app: taptap-rback
+    spec:
+      containers:
+        - name: taptap-rback
+          image: taptap-rback:0.1.0
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: BIND_ADDR
+              value: "0.0.0.0:3000"
+            # 流程状态在进程内存里，多副本会互相看不见对方发起的 flow，
+            # 因此这里固定单副本。要扩容得先把流程状态迁移到共享存储。
+            - name: TAPTAP_CN_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: taptap-rback-secrets
+                  key: TAPTAP_CN_CLIENT_ID
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: taptap-rback-secrets
+                  key: SESSION_SECRET
+            # 本次不启用网页跳转登录：TapTap 是否接受
+            # https://login.example.com/taptap/auth/taptap/web/callback 这种
+            # 公网子路径形式的 redirect_uri 尚未验证（见 ADR 0002）。
+            # 不设置 PUBLIC_BASE_URL 时前端自动走设备码流程。
+            # 设备码流程不受影响，页面本身仍挂在 /taptap/ 子路径下。
+            - name: PUBLIC_BASE_PATH
+              value: "/taptap"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taptap-rback
+  namespace: taptap
+  labels:
+    app: taptap-rback
+spec:
+  type: NodePort
+  selector:
+    app: taptap-rback
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      nodePort: 30084

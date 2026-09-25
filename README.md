@@ -22,10 +22,30 @@ $env:TAPTAP_GLOBAL_CLIENT_ID = "国际应用的 Client ID"
 $env:SESSION_SECRET = "至少 32 字节的随机字符串，生产环境请安全保存"
 $env:BIND_ADDR = "127.0.0.1:3000"
 $env:PUBLIC_BASE_URL = "https://login.example.com"  # 可选，启用网页跳转登录时必填
+$env:PUBLIC_BASE_PATH = "/taptap"  # 可选，服务挂在子路径下时填写
 cargo run
 ```
 
 国内和国际应用的 Client ID 分开配置；只接入一个区域时可省略另一个。默认仅监听本机；部署时由 HTTPS 反向代理对外提供服务。`SESSION_SECRET` 改变后旧会话会失效。`PUBLIC_BASE_URL` 是服务对外的完整基地址（不带路径），用于生成 TapTap 授权回调地址；不设置时 `/auth/taptap/web` 返回 `web_login_not_configured`，手机网页回退到设备码跳转模式。
+
+### 部署到子路径
+
+页面、样式与脚本之间一律使用相对路径，接口调用同样相对当前页面解析，因此**服务本身不需要知道挂载前缀**：反向代理把 `/taptap/` 转发到本服务根路径即可。
+
+```nginx
+location = /taptap { return 301 /taptap/; }
+
+location ^~ /taptap/ {
+    proxy_pass http://127.0.0.1:3000/;   # 结尾的 / 会剥掉 /taptap 前缀
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+`PUBLIC_BASE_PATH` 只影响服务端自己生成的跳转链接（网页授权回调页返回首页的目标）。它接受字母、数字与 `/-_`，其余字符会被拒绝，因为它会被拼进服务端生成的 HTML 与 JS。不设置时等同于挂在根路径，行为与之前一致。
+
+注意 `PUBLIC_BASE_URL` 与 `PUBLIC_BASE_PATH` 是两件事：前者决定 TapTap 回调地址的**域名**，后者决定本服务在**该域名下的挂载位置**。挂在子路径且启用网页跳转登录时，两者需分别配置，且回调地址需要被 TapTap 接受（见 `docs/decisions/0002-web-authorize-flow.md`）。
 
 ## HTTP API
 

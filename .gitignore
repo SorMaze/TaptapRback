@@ -1,3 +1,6 @@
 /target
 .env
 .env.*
+.workbuddy/
+# 本地构建的部署二进制（deploy/Dockerfile 的构建上下文）
+/deploy/taptap-rback

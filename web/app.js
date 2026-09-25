@@ -136,7 +136,7 @@ async function startLogin() {
   setStatus("正在连接 TapTap 授权服务…", "连接中");
   try {
     if (isMobile && webLogin) {
-      const { response, data } = await request("/auth/taptap/web", {
+      const { response, data } = await request("auth/taptap/web", {
         method: "POST",
         body: JSON.stringify({ region }),
       });
@@ -148,7 +148,7 @@ async function startLogin() {
       window.location.assign(authUrl.href);
       return;
     }
-    const { response, data } = await request("/auth/taptap/device", {
+    const { response, data } = await request("auth/taptap/device", {
       method: "POST",
       body: JSON.stringify({ region }),
     });
@@ -210,7 +210,7 @@ async function poll(flowId, current) {
   if (current !== generation) return;
   try {
     const { response, data } = await request(
-      `/auth/taptap/device/${encodeURIComponent(flowId)}/poll`,
+      `auth/taptap/device/${encodeURIComponent(flowId)}/poll`,
       { method: "POST" },
     );
     if (current !== generation) return;
@@ -244,7 +244,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 async function finishLogin(login) {
-  const { response, data } = await request("/auth/me", {
+  const { response, data } = await request("auth/me", {
     headers: { Authorization: `Bearer ${login.session_token}` },
   });
   if (
@@ -282,7 +282,7 @@ async function restoreSession() {
   const token = sessionStorage.getItem("taptap_game_session");
   if (!token) return false;
   try {
-    const { response, data } = await request("/auth/me", {
+    const { response, data } = await request("auth/me", {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!response.ok) throw new Error("expired");
@@ -351,7 +351,7 @@ ui.avatar.addEventListener("error", () => {
 
 (async () => {
   try {
-    const { response, data } = await request("/auth/config");
+    const { response, data } = await request("auth/config");
     if (!response.ok) throw new Error("服务配置不可用");
     ui.cn.disabled = !data.cn;
     ui.global.disabled = !data.global;

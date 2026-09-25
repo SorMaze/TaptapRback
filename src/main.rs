@@ -30,6 +30,9 @@ struct Config {
     global_client_id: Option<String>,
     session_secret: Vec<u8>,
     public_base_url: Option<String>,
+    /// 服务对外挂载的子路径，规范为 "" 或 "/prefix"（无尾斜杠）。
+    /// 只影响服务端自己生成的跳转链接；请求路径的前缀由反向代理剥离。
+    public_base_path: String,
 }
 
 impl Config {
@@ -49,20 +52,20 @@ impl Config {
         if session_secret.len() < 32 {
             return Err("SESSION_SECRET must contain at least 32 bytes".into());
         }
-        let public_base_url = env::var("PUBLIC_BASE_URL")
-            .ok()
-            .filter(|v| !v.is_empty());
+        let public_base_url = env::var("PUBLIC_BASE_URL").ok().filter(|v| !v.is_empty());
         if let Some(base) = &public_base_url
             && !base.starts_with("https://")
             && !base.starts_with("http://")
         {
             return Err("PUBLIC_BASE_URL must start with https:// or http://".into());
         }
+        let public_base_path = normalize_base_path(env::var("PUBLIC_BASE_PATH").ok())?;
         Ok(Self {
             cn_client_id,
             global_client_id,
             session_secret,
             public_base_url,
+            public_base_path,
         })
     }
 
@@ -72,6 +75,28 @@ impl Config {
             Region::Global => self.global_client_id.as_deref(),
         }
     }
+}
+
+/// 把 PUBLIC_BASE_PATH 规范成 "" 或 "/prefix"。空值与 "/" 都表示挂在根路径。
+/// 只接受字母、数字与 `/ - _`，避免它被拼进服务端生成的 HTML/JS 时带来注入面。
+fn normalize_base_path(raw: Option<String>) -> Result<String, String> {
+    let Some(raw) = raw else {
+        return Ok(String::new());
+    };
+    let trimmed = raw.trim().trim_end_matches('/');
+    let trimmed = trimmed.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'-' || b == b'_')
+    {
+        return Err(
+            "PUBLIC_BASE_PATH may only contain ASCII letters, digits, '/', '-' and '_'".into(),
+        );
+    }
+    Ok(format!("/{trimmed}"))
 }
 
 #[derive(Clone)]
@@ -416,10 +441,7 @@ async fn web_start(
         .config
         .client_id(body.region)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "region_not_configured"))?;
-    let redirect_uri = format!(
-        "{}/auth/taptap/web/callback",
-        base.trim_end_matches('/')
-    );
+    let redirect_uri = format!("{}/auth/taptap/web/callback", base.trim_end_matches('/'));
     let mut random = [0u8; 64];
     getrandom::fill(&mut random)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "random_error"))?;
@@ -509,17 +531,19 @@ fn callback_page(title: &str, body: &str) -> Html<String> {
     ))
 }
 
-fn callback_error_page(detail: &str) -> Html<String> {
+fn callback_error_page(base_path: &str, detail: &str) -> Html<String> {
+    let home = format!("{base_path}/");
     callback_page(
         "登录失败",
         &format!(
-            "<h1>登录未完成</h1><p>{}</p><p><a href=\"/\">返回登录页重试</a></p>",
+            "<h1>登录未完成</h1><p>{}</p><p><a href=\"{home}\">返回登录页重试</a></p>",
             html_escape(detail)
         ),
     )
 }
 
-fn callback_success_page(login: &LoginResponse) -> Html<String> {
+fn callback_success_page(base_path: &str, login: &LoginResponse) -> Html<String> {
+    let home = format!("{base_path}/");
     let payload = json_for_script(&serde_json::json!({
         "session_token": login.session_token,
         "region": login.region,
@@ -545,9 +569,9 @@ fn callback_success_page(login: &LoginResponse) -> Html<String> {
           avatar: login.user.avatar || null,
         }}),
       );
-      location.replace("/");
+      location.replace("{home}");
     </script>
-    <noscript><p><a href="/">返回登录页</a></p></noscript>"#
+    <noscript><p><a href="{home}">返回登录页</a></p></noscript>"#
         ),
     )
 }
@@ -556,30 +580,31 @@ async fn web_callback(
     State(state): State<AppState>,
     Query(query): Query<WebCallbackQuery>,
 ) -> (StatusCode, Html<String>) {
+    let base_path = state.config.public_base_path.clone();
     if let Some(denied) = query.error {
         return (
             StatusCode::BAD_REQUEST,
-            callback_error_page(&format!("TapTap 返回错误：{denied}")),
+            callback_error_page(&base_path, &format!("TapTap 返回错误：{denied}")),
         );
     }
     let (Some(code), Some(flow_id)) = (query.code, query.state) else {
         return (
             StatusCode::BAD_REQUEST,
-            callback_error_page("回调参数不完整"),
+            callback_error_page(&base_path, "回调参数不完整"),
         );
     };
     let flow = state.web_flows.lock().await.get(&flow_id).cloned();
     let Some(flow) = flow else {
         return (
             StatusCode::NOT_FOUND,
-            callback_error_page("登录流程不存在或已过期，请重新发起"),
+            callback_error_page(&base_path, "登录流程不存在或已过期，请重新发起"),
         );
     };
     let mut flow = flow.lock().await;
     if flow.finished {
         return (
             StatusCode::NOT_FOUND,
-            callback_error_page("登录流程已被使用，请重新发起"),
+            callback_error_page(&base_path, "登录流程已被使用，请重新发起"),
         );
     }
     flow.finished = true;
@@ -588,7 +613,7 @@ async fn web_callback(
         state.web_flows.lock().await.remove(&flow_id);
         return (
             StatusCode::GONE,
-            callback_error_page("登录流程已过期，请重新发起"),
+            callback_error_page(&base_path, "登录流程已过期，请重新发起"),
         );
     }
     let region = flow.region;
@@ -597,37 +622,52 @@ async fn web_callback(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                callback_error_page("该区域未配置"),
+                callback_error_page(&base_path, "该区域未配置"),
             );
         }
     };
     let result = state
         .tap
-        .exchange_code(region, client_id, &code, &flow.redirect_uri, &flow.code_verifier)
+        .exchange_code(
+            region,
+            client_id,
+            &code,
+            &flow.redirect_uri,
+            &flow.code_verifier,
+        )
         .await;
     let token = match result {
         Ok(token) => token,
         Err(e) => {
             let (status, _) = tap_error(e);
-            return (status, callback_error_page("授权凭证校验失败，请重试"));
+            return (
+                status,
+                callback_error_page(&base_path, "授权凭证校验失败，请重试"),
+            );
         }
     };
     let user = match state.tap.profile(region, client_id, &token, true).await {
         Ok(user) => user,
         Err(e) => {
             let (status, _) = tap_error(e);
-            return (status, callback_error_page("获取用户信息失败，请重试"));
+            return (
+                status,
+                callback_error_page(&base_path, "获取用户信息失败，请重试"),
+            );
         }
     };
     let login = match issue_session(&state, region, user) {
         Ok(login) => login,
         Err((status, _)) => {
-            return (status, callback_error_page("建立游戏会话失败，请重试"));
+            return (
+                status,
+                callback_error_page(&base_path, "建立游戏会话失败，请重试"),
+            );
         }
     };
     drop(flow);
     state.web_flows.lock().await.remove(&flow_id);
-    (StatusCode::OK, callback_success_page(&login))
+    (StatusCode::OK, callback_success_page(&base_path, &login))
 }
 
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Claims>> {
@@ -751,6 +791,7 @@ mod tests {
                 global_client_id: None,
                 session_secret: vec![42; 32],
                 public_base_url: None,
+                public_base_path: String::new(),
             },
             tap: TapClient::new()
                 .unwrap()
@@ -765,14 +806,18 @@ mod tests {
 
         let page = client.get(&base).send().await.unwrap();
         assert_eq!(page.status(), StatusCode::OK);
-        assert!(page.text().await.unwrap().contains("游戏登录"));
+        let page_body = page.text().await.unwrap();
+        assert!(page_body.contains("游戏登录"));
+        // 资源与接口路径必须是相对路径，服务才能挂在任意子路径下。
+        assert!(page_body.contains(r#"href="assets/style.css""#));
+        assert!(page_body.contains(r#"src="assets/app.js""#));
         let script = client
             .get(format!("{base}/assets/app.js"))
             .send()
             .await
             .unwrap();
         assert_eq!(script.status(), StatusCode::OK);
-        assert!(script.text().await.unwrap().contains("/auth/taptap/device"));
+        assert!(script.text().await.unwrap().contains("auth/taptap/device"));
 
         let login_response = client.post(format!("{base}/auth/taptap/sdk"))
             .json(&json!({"region":"cn","access_token":{"kid":"kid-1","mac_key":"secret","mac_algorithm":"hmac-sha-1"},"scopes":["public_profile"]}))
@@ -856,10 +901,7 @@ mod tests {
                 form.get("redirect_uri")
                     .is_some_and(|v| v.ends_with("/auth/taptap/web/callback"))
             );
-            assert!(
-                form.get("code_verifier")
-                    .is_some_and(|v| v.len() >= 43)
-            );
+            assert!(form.get("code_verifier").is_some_and(|v| v.len() >= 43));
             Json(json!({"success":true,"data":{
                 "kid":"kid-1","mac_key":"secret","mac_algorithm":"hmac-sha-1","scope":"public_profile"
             }}))
@@ -892,6 +934,7 @@ mod tests {
                 global_client_id: None,
                 session_secret: vec![42; 32],
                 public_base_url: Some(base.clone()),
+                public_base_path: "/taptap".into(),
             },
             tap: TapClient::new()
                 .unwrap()
@@ -961,6 +1004,8 @@ mod tests {
         assert!(page.contains("taptap_game_session"));
         assert!(page.contains("eyJ"));
         assert!(page.contains("location.replace"));
+        // 回调页的跳转目标必须带上服务对外挂载的子路径。
+        assert!(page.contains(r#"location.replace("/taptap/")"#));
 
         let replay = client
             .get(format!(
@@ -979,6 +1024,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
-        assert!(denied.text().await.unwrap().contains("access_denied"));
+        let denied_body = denied.text().await.unwrap();
+        assert!(denied_body.contains("access_denied"));
+        assert!(denied_body.contains(r#"href="/taptap/""#));
+    }
+
+    #[test]
+    fn base_path_is_normalized_and_restricted() {
+        assert_eq!(normalize_base_path(None).unwrap(), "");
+        assert_eq!(normalize_base_path(Some(String::new())).unwrap(), "");
+        assert_eq!(normalize_base_path(Some("/".into())).unwrap(), "");
+        assert_eq!(
+            normalize_base_path(Some("taptap".into())).unwrap(),
+            "/taptap"
+        );
+        assert_eq!(
+            normalize_base_path(Some("/taptap/".into())).unwrap(),
+            "/taptap"
+        );
+        assert_eq!(
+            normalize_base_path(Some("//deploy/taptap//".into())).unwrap(),
+            "/deploy/taptap"
+        );
+        // 会被拼进服务端生成的 HTML/JS，因此拒绝引号与尖括号。
+        assert!(normalize_base_path(Some("/taptap/\"><script>".into())).is_err());
     }
 }
